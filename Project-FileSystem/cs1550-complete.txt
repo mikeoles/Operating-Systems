@@ -1,0 +1,890 @@
+*
+        FUSE: Filesystem in Userspace
+        Copyright (C) 2001-2007  Miklos Szeredi <miklos@szeredi.hu>
+
+        This program can be distributed under the terms of the GNU GPL.
+        See the file COPYING.
+*/
+
+#define FUSE_USE_VERSION 26
+
+#include <fuse.h>
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+
+//size of a disk block
+#define BLOCK_SIZE 512
+
+#define DISK_SIZE 5242880
+
+//New difines added
+#define NUM_BLOCKS DISK_SIZE / BLOCK_SIZE //10240 blocks
+//Bitmap is a char array that takes up the last 20 blocks of .disk
+#define BITMAP_SIZE NUM_BLOCKS - (NUM_BLOCKS / BLOCK_SIZE)//Stores entire disk minus bitmap
+
+//we'll use 8.3 filenames
+#define MAX_FILENAME 8
+#define MAX_EXTENSION 3
+
+//How many files can there be in one directory?
+#define MAX_FILES_IN_DIR (BLOCK_SIZE - sizeof(int)) / ((MAX_FILENAME + 1) + (MAX_EXTENSION + 1) + sizeof(size_t) + sizeof(long))
+
+//The attribute packed means to not align these things
+struct cs1550_directory_entry
+{
+        int nFiles;     //How many files are in this directory.
+                                //Needs to be less than MAX_FILES_IN_DIR
+
+        struct cs1550_file_directory
+        {
+                char fname[MAX_FILENAME + 1];   //filename (plus space for nul)
+                char fext[MAX_EXTENSION + 1];   //extension (plus space for nul)
+                size_t fsize;                                   //file size
+                long startBlock;                               //where the first block is on disk
+       } __attribute__((packed)) files[MAX_FILES_IN_DIR];      //There is an array of these
+
+        //This is some space to get this to be exactly the size of the disk block.
+        //Don't use it for anything.
+        char padding[BLOCK_SIZE - MAX_FILES_IN_DIR * sizeof(struct cs1550_file_directory) - sizeof(int)];
+};
+
+typedef struct cs1550_root_directory cs1550_root_directory;
+
+#define MAX_DIRS_IN_ROOT (BLOCK_SIZE - sizeof(int)) / ((MAX_FILENAME + 1) + sizeof(long))
+
+struct cs1550_root_directory
+{
+        int nDirectories;       //How many subdirectories are in the root
+                                                //Needs to be less than MAX_DIRS_IN_ROOT
+        struct cs1550_directory
+        {
+                char dname[MAX_FILENAME + 1];   //directory name (plus space for nul)
+                long startBlock;                               //where the directory block is on disk
+        } __attribute__((packed)) directories[MAX_DIRS_IN_ROOT];        //There is an array of these
+
+        //This is some space to get this to be exactly the size of the disk block.
+        //Don't use it for anything.
+        char padding[BLOCK_SIZE - MAX_DIRS_IN_ROOT * sizeof(struct cs1550_directory) - sizeof(int)];
+} ;
+
+
+typedef struct cs1550_directory_entry cs1550_directory_entry;
+
+//How much data can one block hold?
+#define MAX_DATA_IN_BLOCK (BLOCK_SIZE - sizeof(long))
+
+struct cs1550_disk_block
+{
+        //The next disk block, if needed. This is the next pointer in the linked
+        //allocation list
+        long nNextBlock;
+
+        //And all the rest of the space in the block can be used for actual data
+        //storage.
+        char data[MAX_DATA_IN_BLOCK];
+};
+
+typedef struct cs1550_disk_block cs1550_disk_block;
+
+/*
+ * Called whenever the system wants to know the file attributes, including
+ * simply whether the file exists or not.
+ *
+ * man -s 2 stat will show the fields of a stat structure
+ */
+
+//find startblock for a directory
+static long find_directory(char dir[MAX_FILENAME+1]) {
+
+        long startBlock = -1;
+        int found = 0;
+        int i = 0;
+
+        cs1550_root_directory *root_dir;
+        root_dir = (struct cs1550_root_directory *) malloc(sizeof(struct cs1550_root_directory));
+        FILE* fd;
+
+        fd = fopen(".disk","rb");
+        fseek(fd,0,SEEK_SET);//Go to the start of .disk
+
+        fread(root_dir, sizeof(cs1550_root_directory), 1, fd);//Get the number of directories inside root
+        for(i=0;i<root_dir->nDirectories;i++){//Search through the directories to see if any match directory
+                if(strcmp(dir,root_dir->directories[i].dname) == 0){//If we found the directory
+                        found = 1;
+                        startBlock = root_dir->directories[i].startBlock;
+                        break;
+                }
+        }
+
+        return startBlock;
+}
+
+//return disk location of first available block
+static long find_open_block(){
+
+        int i = 1;
+        char bitmap[BITMAP_SIZE];
+        FILE *fd;
+
+        fd = fopen(".disk","rb+");
+        fseek(fd,-NUM_BLOCKS,SEEK_END);//Go to the start of the bitmap from the end of the file
+        fread(&bitmap,BITMAP_SIZE,1,fd);//read bitmap from disk into char array bitmap
+
+        //go through bitmap and find the first open space
+        for(i=1; i<BITMAP_SIZE;i++){//start at 1 because 0 is root
+                if(bitmap[i] == 0){//i is the first free block
+                        bitmap[i] = 1;
+                        fseek(fd,-NUM_BLOCKS,SEEK_END);//Go to the start of the bitmap from the end of the file
+                        fwrite(&bitmap,BITMAP_SIZE,1,fd);
+                        return (long)BLOCK_SIZE * i;//return the address to it
+                }
+        }
+
+    //if we got here there were no more free blocks, return error
+    return -1;
+}
+
+static int cs1550_getattr(const char *path, struct stat *stbuf)
+{
+        int res = 0;//return value
+        int i = 0;
+        int exists = 0;
+        long startBlock;
+
+        cs1550_root_directory *root_dir;
+        cs1550_directory_entry *dir_entry;
+        root_dir = (struct cs1550_root_directory *) malloc(sizeof(struct cs1550_root_directory));
+        dir_entry = (struct cs1550_directory_entry *) malloc(sizeof(struct cs1550_directory_entry));
+        FILE *fd;
+
+        char directory[MAX_FILENAME + 1], filename[MAX_FILENAME + 1], extension[MAX_EXTENSION + 1];
+
+        memset(directory, 0, MAX_FILENAME + 1);
+        memset(filename, 0, MAX_FILENAME + 1);
+        memset(extension, 0, MAX_EXTENSION + 1);
+
+        sscanf(path, "/%[^/]/%[^.].%s", directory, filename, extension);
+
+        memset(stbuf, 0, sizeof(struct stat));
+
+        if (strcmp(path, "/") == 0) {//Path is root directory
+                stbuf->st_mode = S_IFDIR | 0755;
+                stbuf->st_nlink = 2;
+                res = 0;
+        }else{
+                startBlock = find_directory(directory);//Check for directory in root and returns its location
+
+                if(startBlock != -1){//if directory exists
+                        if(strlen(filename)==0){//found directory
+                                stbuf->st_mode = S_IFDIR | 0755;
+                                stbuf->st_nlink = 2;
+                                res = 0;
+                        }else{//We are looking for a file
+                                fd = fopen(".disk","rb+");
+                                fseek(fd,startBlock,SEEK_SET);//Go to the directory
+                                fread(dir_entry, sizeof(cs1550_directory_entry), 1, fd);//Get the number of files inside subdirectory
+
+                                for(i=0; i<dir_entry->nFiles; i++){//check if directory exists
+                                        if(strcmp(filename,dir_entry->files[i].fname)==0){
+                                                exists = 1;
+                                                break;
+                                        }
+                                }
+                                if(exists==1){
+                                        stbuf->st_mode = S_IFREG | 0666;
+                                        stbuf->st_nlink = 1; //file links
+                                        stbuf->st_size = dir_entry->files[i].fsize; //file size - make sure you replace with real size!
+                                        res = 0; // no error file found
+                                }else{
+                                       res = -ENOENT;
+                                }
+                                fclose(fd);
+                        }
+                }else{
+                        res = -ENOENT;//Directory doesn't exist
+                }
+        }
+        return res;
+}
+
+/*
+ * Called whenever the contents of a directory are desired. Could be from an 'ls'
+ * or could even be when a user hits TAB to do autocompletion
+ */
+static int cs1550_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
+                         off_t offset, struct fuse_file_info *fi)
+{
+        (void) offset;
+        (void) fi;
+
+
+        int i = 0;
+        int exists = 0;
+        long startBlock;
+        char fullName[MAX_FILENAME + 1 + MAX_EXTENSION + 1];
+
+        cs1550_root_directory *root_dir;
+        cs1550_directory_entry *dir_entry;
+        root_dir = (struct cs1550_root_directory *) malloc(sizeof(struct cs1550_root_directory));
+        dir_entry = (struct cs1550_directory_entry *) malloc(sizeof(struct cs1550_directory_entry));
+        FILE* fd;
+
+        char directory[MAX_FILENAME + 1], filename[MAX_FILENAME + 1], extension[MAX_EXTENSION + 1];
+
+        memset(directory, 0, MAX_FILENAME + 1);
+        memset(filename, 0, MAX_FILENAME + 1);
+        memset(extension, 0, MAX_EXTENSION + 1);
+
+        sscanf(path, "/%[^/]/%[^.].%s", directory, filename, extension);
+
+        if (strcmp(path, "/") != 0){//if this is a subdirectory
+                fd = fopen(".disk","rb");
+                fseek(fd,0,SEEK_SET);//Go to the start of .disk
+                fread(root_dir, sizeof(cs1550_root_directory), 1, fd);//Get the number of directories
+
+                for(i=0;i<root_dir->nDirectories;i++){//Search through the directories in root
+                        if(strcmp(directory,root_dir->directories[i].dname)==0){
+                                exists = 1;
+                                startBlock = root_dir->directories[i].startBlock;
+                                break;
+                        }
+                }
+
+                if(exists){
+                        filler(buf, ".", NULL,0);
+                        filler(buf, "..", NULL, 0);
+                        fseek(fd,startBlock,SEEK_SET);
+                        fread(dir_entry, sizeof(cs1550_directory_entry), 1, fd);//Get the number of files inside subdirectory
+                        for(i=0; i<dir_entry->nFiles; i++){
+                               strcpy(fullName,dir_entry->files[i].fname);
+                                strcat(fullName,".");
+                                strcat(fullName,dir_entry->files[i].fext);
+                                filler(buf,fullName,NULL,0);
+                        }
+                        fclose(fd);
+                        return 0;
+                }else{
+                        fclose(fd);
+                        return -ENOENT;
+                }
+        }else{//if this directory is the root, read from root_directory
+                filler(buf, ".", NULL,0);
+                filler(buf, "..", NULL, 0);
+                fd = fopen(".disk","rb");
+                fseek(fd,0,SEEK_SET);
+                fread(root_dir,sizeof(cs1550_root_directory),1,fd);
+                for(i=0;i<root_dir->nDirectories;i++){
+                        filler(buf,root_dir->directories[i].dname,NULL,0);
+                }
+                fclose(fd);
+                return 0;
+        }
+}
+
+/*
+ * Creates a directory. We can ignore mode since we're not dealing with
+ * permissions, as long as getattr returns appropriate ones for us.
+ */
+static int cs1550_mkdir(const char *path, mode_t mode)
+{
+        printf("mkdir\n");
+        (void) path;
+        (void) mode;
+
+        long newStartBlock;
+        int i = 0;
+        int found = 0;
+
+        cs1550_root_directory *root_dir;
+        root_dir = (struct cs1550_root_directory *) malloc(sizeof(struct cs1550_root_directory));
+        FILE* fd;
+
+        char directory[MAX_FILENAME + 1], filename[MAX_FILENAME + 1], extension[MAX_EXTENSION + 1];
+
+        memset(directory, 0, MAX_FILENAME + 1);
+        memset(filename, 0, MAX_FILENAME + 1);
+        memset(extension, 0, MAX_EXTENSION + 1);
+
+        sscanf(path, "/%[^/]/%[^.].%s", directory, filename, extension);
+
+        if(strlen(directory)>MAX_FILENAME){
+                return -ENAMETOOLONG;
+        }
+
+        if(strlen(filename)!=0){
+                return -EPERM;
+        }
+
+        //Check if directory exists
+        fd = fopen(".disk","rb+");
+        fseek(fd,0,SEEK_SET);//Go to the start of .disk
+        fread(root_dir, sizeof(cs1550_root_directory), 1, fd);//Get root
+
+        for(i=0;i<MAX_DIRS_IN_ROOT;i++){//Search through the directories to see if any match directory
+                if(strcmp(root_dir->directories[i].dname,directory)==0){
+                    found = 1;
+                }
+        }
+        fclose(fd);
+
+        if(found){//already exists
+                return -EEXIST;
+        }
+
+        //Root is full
+        if(root_dir->nDirectories==MAX_DIRS_IN_ROOT){
+            return -ENOENT;
+        }
+
+        newStartBlock = find_open_block();//Find a good location for the directory
+
+        if(newStartBlock == -1){//No more space on disk
+                return -1;
+        }
+
+        //Update root with new directory
+        strcpy(root_dir->directories[root_dir->nDirectories].dname,directory);
+        root_dir->directories[root_dir->nDirectories].startBlock = newStartBlock;
+        root_dir->nDirectories += 1;//Increase number of directories in root
+
+        //write updated root to disk
+        fopen(".disk","rb+");
+        fseek(fd,0,SEEK_SET);
+        fwrite(root_dir,sizeof(cs1550_root_directory),1,fd);//Add new root file to disk
+        fclose(fd);
+
+        return 0;
+}
+
+/*
+ * Removes a directory.
+ */
+static int cs1550_rmdir(const char *path)
+{
+        (void) path;
+    return 0;
+}
+
+/*
+ * Does the actual creation of a file. Mode and dev can be ignored.
+ *
+ */
+static int cs1550_mknod(const char *path, mode_t mode, dev_t dev)
+{
+        (void) mode;
+        (void) dev;
+        (void) path;
+
+        int i = 0;
+        long startBlock = -1;
+        long newStartBlock = 0;
+
+        cs1550_root_directory *root_dir;
+        cs1550_directory_entry *dir_entry;
+        root_dir = (struct cs1550_root_directory *) malloc(sizeof(struct cs1550_root_directory));
+        dir_entry = (struct cs1550_directory_entry *) malloc(sizeof(struct cs1550_directory_entry));
+        FILE* fd;
+
+        char directory[MAX_FILENAME + 1], filename[MAX_FILENAME + 1], extension[MAX_EXTENSION + 1];
+
+        memset(directory, 0, MAX_FILENAME + 1);
+        memset(filename, 0, MAX_FILENAME + 1);
+        memset(extension, 0, MAX_EXTENSION + 1);
+
+        sscanf(path, "/%[^/]/%[^.].%s", directory, filename, extension);
+
+        if(strlen(filename)>MAX_FILENAME||strlen(extension)>MAX_EXTENSION){
+                return -ENAMETOOLONG;
+        }
+
+        if (strcmp(path, "/") == 0){
+                return -EPERM;
+        }
+
+        //check if file already exists
+        fd = fopen(".disk","rb+");
+        fseek(fd,0,SEEK_SET);//Go to the start of .disk
+        fread(root_dir, sizeof(cs1550_root_directory), 1, fd);//Get root
+
+        for(i=0;i<MAX_DIRS_IN_ROOT;i++){//Search through the directories to see i$
+                if(strcmp(root_dir->directories[i].dname,directory)==0){
+                        startBlock = root_dir->directories[i].startBlock;
+                        break;
+                }
+        }
+
+        if(startBlock == -1){//Directory not found
+                fclose(fd);
+                return -ENOENT;
+        }
+
+        //return error if file already exists
+        fseek(fd,startBlock,SEEK_SET);
+        fread(dir_entry, sizeof(cs1550_directory_entry), 1, fd);//Get the directory entry
+        for(i=0; i<dir_entry->nFiles; i++){//search directory to see if file already exists
+                if(strcmp(dir_entry->files[i].fname,filename)==0 && strcmp(dir_entry->files[i].fext,extension) == 0){
+                        fclose(fd);
+                        return -EEXIST;
+                }
+        }
+
+        newStartBlock = find_open_block();//Find a good location for the file on disk
+
+        i = dir_entry->nFiles;
+        dir_entry->nFiles += 1;//Increase number of files in directory
+        strcpy(dir_entry->files[i].fname,filename);//We can add the file to the directory
+        strcpy(dir_entry->files[i].fext,extension);
+        dir_entry->files[i].fsize = 0;
+        dir_entry->files[i].startBlock = newStartBlock;
+
+
+        //write updated directory entry to disk
+        fseek(fd,startBlock,SEEK_SET);//seek to start of directory entry
+        fwrite(dir_entry,sizeof(cs1550_directory_entry),1,fd);//Add the updated directory entry to disk
+       fclose(fd);
+
+        return 0;
+}
+
+/*
+ * Deletes a file
+ */
+static int cs1550_unlink(const char *path)
+{
+        (void) path;
+        int i = 0;
+        int found = -1;
+        long startBlock = -1;
+        char bitmap[BITMAP_SIZE];
+
+        FILE* fd;
+        cs1550_root_directory *root_dir;
+        cs1550_directory_entry *dir_entry;
+        cs1550_disk_block *disk_block;
+        root_dir = (struct cs1550_root_directory *) malloc(sizeof(struct cs1550_root_directory));
+        dir_entry = (struct cs1550_directory_entry *) malloc(sizeof(struct cs1550_directory_entry));
+        disk_block = (struct cs1550_disk_block *) malloc(sizeof(struct cs1550_disk_block));
+
+        char directory[MAX_FILENAME + 1], filename[MAX_FILENAME + 1], extension[MAX_EXTENSION + 1];
+
+        memset(directory, 0, MAX_FILENAME + 1);
+        memset(filename, 0, MAX_FILENAME + 1);
+        memset(extension, 0, MAX_EXTENSION + 1);
+
+        sscanf(path, "/%[^/]/%[^.].%s", directory, filename, extension);
+
+        if(strlen(filename)==0){//No file this is a directory
+                return -EISDIR;
+        }
+
+        fd = fopen(".disk","rb+");
+        fseek(fd,-NUM_BLOCKS,SEEK_END);//Go to the start of the bitmap from the e$
+        fread(&bitmap,BITMAP_SIZE,1,fd);//
+
+        fseek(fd,0,SEEK_SET);//Go to the start of .disk
+        fread(root_dir, sizeof(cs1550_root_directory), 1, fd);//Get root
+
+        for(i=0;i<MAX_DIRS_IN_ROOT;i++){//Search root for directory
+                if(strcmp(root_dir->directories[i].dname,directory)==0){
+                        startBlock = root_dir->directories[i].startBlock;
+                        break;
+                }
+        }
+
+        if(startBlock == -1){//if the directory is not found
+                return -ENOENT;
+        }
+
+        //return error if file already exists
+        fseek(fd,startBlock,SEEK_SET);
+        fread(dir_entry, sizeof(cs1550_directory_entry), 1, fd);//Get the number of files in directory
+        fclose(fd);
+        for(i=0; i<dir_entry->nFiles; i++){
+                if(strcmp(dir_entry->files[i].fname,filename)==0 && strcmp(dir_entry->files[i].fext,extension) == 0){
+                        found = i;//if we found the file we are trying to delete inside this directory
+                        break;
+                }
+        }
+
+        if(found == -1){//if the file is not found
+                return -ENOENT;
+        }
+
+        //reset bitmap to 0
+        bitmap[dir_entry->files[found].startBlock/BLOCK_SIZE] = 0;
+        fd = fopen(".disk","rb+");
+        fseek(fd,dir_entry->files[found].startBlock,SEEK_SET);
+       fread(disk_block,sizeof(cs1550_disk_block),1,fd);
+        i = 0;
+        while(disk_block->nNextBlock!=0 && i<NUM_BLOCKS){
+                bitmap[disk_block->nNextBlock/BLOCK_SIZE] = 0;
+                fseek(fd,disk_block->nNextBlock,SEEK_SET);
+                fread(disk_block,sizeof(cs1550_directory_entry),1,fd);
+                i++;
+        }
+
+        //update directory entry
+        dir_entry->nFiles--;//decrease the number of files
+        strcpy(dir_entry->files[found].fname,"");
+        strcpy(dir_entry->files[found].fext,"");
+        dir_entry->files[found].fsize = BLOCK_SIZE;
+        dir_entry->files[found].startBlock = 0;
+
+        for(i=found; i<dir_entry->nFiles; i++){
+                dir_entry->files[i] = dir_entry->files[i+1];
+        }
+
+        fseek(fd,-NUM_BLOCKS,SEEK_END);//Go to the start of the bitmap from the end of the file
+        fwrite(&bitmap,BITMAP_SIZE,1,fd);
+
+        fseek(fd,startBlock,SEEK_SET);
+        fwrite(dir_entry,sizeof(cs1550_directory_entry),1,fd);
+        fclose(fd);
+        return 0;
+}
+
+/*
+ * Read size bytes from file into buf starting from offset
+ *
+ */
+static int cs1550_read(const char *path, char *buf, size_t size, off_t offset,
+                          struct fuse_file_info *fi)
+{
+        (void) buf;
+        (void) offset;
+        (void) fi;
+        (void) path;
+        (void) size;
+
+        int i = 0;
+        int found = 0;
+        long startBlock = -1;
+        int toRead = 0;
+
+        FILE* fd;
+        cs1550_root_directory *root_dir;
+        cs1550_directory_entry *dir_entry;
+        cs1550_disk_block *disk_block;
+        root_dir = (struct cs1550_root_directory *) malloc(sizeof(struct cs1550_root_directory));
+        dir_entry = (struct cs1550_directory_entry *) malloc(sizeof(struct cs1550_directory_entry));
+        disk_block = (struct cs1550_disk_block *) malloc(sizeof(struct cs1550_disk_block));
+
+        char directory[MAX_FILENAME + 1], filename[MAX_FILENAME + 1], extension[MAX_EXTENSION + 1];
+
+        memset(directory, 0, MAX_FILENAME + 1);
+        memset(filename, 0, MAX_FILENAME + 1);
+        memset(extension, 0, MAX_EXTENSION + 1);
+
+        sscanf(path, "/%[^/]/%[^.].%s", directory, filename, extension);
+
+        //if its a directory
+        if(strlen(filename)==0){
+                return -EISDIR;
+        }
+
+        fd = fopen(".disk","rb+");
+        fseek(fd,0,SEEK_SET);//Go to the start of .disk
+        fread(root_dir, sizeof(cs1550_root_directory), 1, fd);//Get root
+
+        for(i=0;i<root_dir->nDirectories;i++){//Search root for directory
+                if(strcmp(root_dir->directories[i].dname,directory)==0){
+                       startBlock = root_dir->directories[i].startBlock;
+                        break;
+                }
+        }
+
+        if(startBlock == -1){//if the directory is not found
+                return -ENOENT;
+        }
+
+        //return error if file already exists
+        fseek(fd,startBlock,SEEK_SET);
+        fread(dir_entry, sizeof(cs1550_directory_entry), 1, fd);//Get the number of files in directory
+        for(i=0; i<dir_entry->nFiles; i++){
+                if(strcmp(dir_entry->files[i].fname,filename)==0 && strcmp(dir_entry->files[i].fext,extension) == 0){
+                        found = 1;
+                        startBlock = dir_entry->files[i].startBlock;
+                        break;
+                }
+        }
+        toRead = dir_entry->files[i].fsize;
+
+        if(found != 1){//if the file is not found
+                return -ENOENT;
+        }
+
+        if(!toRead>0){//check that size is > 0
+                return -1;
+        }
+
+        if((int)offset>(int)dir_entry->files[i].fsize){//check that offset is <= to the file size
+                return -1;
+        }
+
+        fseek(fd,startBlock,SEEK_SET);//go to the first disk block
+        fread(disk_block, sizeof(cs1550_disk_block), 1, fd);
+
+        i = offset;
+       while(i > MAX_DATA_IN_BLOCK){//go to the diskblock that the offset starts at
+                fseek(fd,disk_block->nNextBlock,SEEK_SET);
+                fread(disk_block, sizeof(cs1550_disk_block), 1, fd);
+                i -= MAX_DATA_IN_BLOCK;
+        }
+
+        while(toRead>0 && i<MAX_DATA_IN_BLOCK){//read the data from the first block
+                *buf = disk_block->data[i];
+                buf++;
+                toRead--;
+                i++;
+        }
+
+        if(toRead==0){
+                return i-(int)offset;
+        }
+
+        //go to next disk block and continue reading
+        fseek(fd,disk_block->nNextBlock,SEEK_SET);
+        fread(disk_block, sizeof(cs1550_disk_block), 1, fd);
+
+        //keep reading data until full size has been read
+        while(toRead>0){
+                i = 0;
+                while(i<MAX_DATA_IN_BLOCK){
+                        *buf = disk_block->data[i];
+                        buf++;
+                        toRead--;
+                        i++;
+                }
+                if(disk_block->nNextBlock == 0){//no more data to rad
+                        break;
+                }
+                fseek(fd,disk_block->nNextBlock,SEEK_SET);
+                fread(disk_block, sizeof(cs1550_disk_block), 1, fd);
+        }
+       return i-(int)offset;
+}
+
+/*
+ * Write size bytes from buf into file starting from offset
+ *
+ */
+static int cs1550_write(const char *path, const char *buf, size_t size,
+                          off_t offset, struct fuse_file_info *fi)
+{
+        (void) buf;
+        (void) offset;
+        (void) fi;
+        (void) path;
+
+        int i = 0;
+        int found = 0;
+        long startBlock = -1;
+        long dirStart = -1;
+        int toWrite = size;
+        int fileNum = 0;
+
+        FILE* fd;
+        cs1550_root_directory *root_dir;
+        cs1550_directory_entry *dir_entry;
+        cs1550_disk_block *disk_block;
+        root_dir = (struct cs1550_root_directory *) malloc(sizeof(struct cs1550_root_directory));
+        dir_entry = (struct cs1550_directory_entry *) malloc(sizeof(struct cs1550_directory_entry));
+        disk_block = (struct cs1550_disk_block *) malloc(sizeof(struct cs1550_disk_block));
+
+        char directory[MAX_FILENAME + 1], filename[MAX_FILENAME + 1], extension[MAX_EXTENSION + 1];
+
+        memset(directory, 0, MAX_FILENAME + 1);
+        memset(filename, 0, MAX_FILENAME + 1);
+        memset(extension, 0, MAX_EXTENSION + 1);
+
+        sscanf(path, "/%[^/]/%[^.].%s", directory, filename, extension);
+
+        //if its a directory
+        if(strlen(filename)==0){
+                return -EISDIR;
+        }
+
+        fd = fopen(".disk","rb+");
+        fseek(fd,0,SEEK_SET);//Go to the start of .disk
+        fread(root_dir, sizeof(cs1550_root_directory), 1, fd);//Get root
+        for(i=0;i<root_dir->nDirectories;i++){//Search root for directory
+                if(strcmp(root_dir->directories[i].dname,directory)==0){
+                        startBlock = root_dir->directories[i].startBlock;
+                        dirStart = startBlock;
+                        break;
+                }
+        }
+
+        if(startBlock == -1){//if the directory is not found
+                return -ENOENT;
+        }
+
+        //return error if file already exists
+        fseek(fd,startBlock,SEEK_SET);
+        fread(dir_entry, sizeof(cs1550_directory_entry), 1, fd);//Get the number of files in directory
+        for(i=0; i<dir_entry->nFiles; i++){
+                if(strcmp(dir_entry->files[i].fname,filename)==0 && strcmp(dir_entry->files[i].fext,extension) == 0){
+                        found = 1;
+                        fileNum = i;
+                        if(dir_entry->files[i].fsize<offset){
+                                fclose(fd);
+                                return -EFBIG;
+                        }
+                        startBlock = dir_entry->files[i].startBlock;
+                        break;
+                }
+        }
+        if(found != 1){//if the file is not found
+                return -ENOENT;
+        }
+        //check that size is > 0
+        if(size<=0){
+                return 0;
+        }
+
+        //write data
+        fseek(fd,startBlock,SEEK_SET);//go to the first disk block
+        fread(disk_block, sizeof(cs1550_disk_block), 1, fd);
+        i = offset;
+        //get to the block that the offset starts at
+        while(i > MAX_DATA_IN_BLOCK){
+                if(disk_block->nNextBlock == 0){//the data needs to be added to a new block
+                        disk_block->nNextBlock = find_open_block();
+                        startBlock = disk_block->nNextBlock;
+                }
+                fseek(fd,disk_block->nNextBlock,SEEK_SET);
+                fread(disk_block, sizeof(cs1550_disk_block), 1, fd);
+                i -= MAX_DATA_IN_BLOCK;
+        }
+
+        //write data in the first block
+        while(toWrite>0 && i<MAX_DATA_IN_BLOCK){
+                disk_block->data[i] = *buf;
+                buf++;
+                toWrite--;
+                i++;
+        }
+        fseek(fd,startBlock,SEEK_SET);
+        fwrite(disk_block, sizeof(cs1550_disk_block), 1, fd);//write new data to disk
+       //go to next disk block and continue reading
+       if(disk_block->nNextBlock == 0 && toWrite != 0){//the data needs to be added to a new block
+                disk_block->nNextBlock = find_open_block();
+                startBlock = disk_block->nNextBlock;
+        }
+        if(toWrite != 0){
+                fseek(fd,disk_block->nNextBlock,SEEK_SET);
+                fread(disk_block, sizeof(cs1550_disk_block), 1, fd);
+        }
+
+        while(toWrite>0){//write rest of the data
+                i = 0;
+                while(i<MAX_DATA_IN_BLOCK){
+                        disk_block->data[i] = *buf;
+                        buf++;
+                        toWrite--;
+                        i++;
+                }
+                fseek(fd,startBlock,SEEK_SET);
+                fwrite(disk_block, sizeof(cs1550_disk_block), 1, fd);//write new data to disk
+                if(disk_block->nNextBlock == 0){//the data needs to be added to a new block
+                        disk_block->nNextBlock = find_open_block();
+                        startBlock = disk_block->nNextBlock;
+                }
+                fseek(fd,disk_block->nNextBlock,SEEK_SET);
+                fread(disk_block, sizeof(cs1550_disk_block), 1, fd);
+        }
+
+        //set size (should be same as input) and return, or error
+        dir_entry->files[fileNum].fsize = offset+size;
+        fseek(fd,dirStart,SEEK_SET);
+        fwrite(dir_entry, sizeof(cs1550_directory_entry), 1, fd);//Get the number of files in directory
+        fclose(fd);
+
+        toWrite = size - toWrite;
+        return toWrite;
+}
+
+/******************************************************************************
+ *
+ *  DO NOT MODIFY ANYTHING BELOW THIS LINE
+ *
+ *****************************************************************************/
+
+/*
+ * truncate is called when a new file is created (with a 0 size) or when an
+ * existing file is made shorter. We're not handling deleting files or
+ * truncating existing ones, so all we need to do here is to initialize
+ * the appropriate directory entry.
+ *
+ */
+static int cs1550_truncate(const char *path, off_t size)
+{
+        (void) path;
+        (void) size;
+
+    return 0;
+}
+
+
+/*
+ * Called when we open a file
+ *
+ */
+static int cs1550_open(const char *path, struct fuse_file_info *fi)
+{
+        (void) path;
+        (void) fi;
+    /*
+        //if we can't find the desired file, return an error
+        return -ENOENT;
+    */
+
+    //It's not really necessary for this project to anything in open
+
+    /* We're not going to worry about permissions for this project, but
+           if we were and we don't have them to the file we should return an error
+
+        return -EACCES;
+    */
+
+    return 0; //success!
+}
+
+/*
+ * Called when close is called on a file descriptor, but because it might
+ * have been dup'ed, this isn't a guarantee we won't ever need the file
+ * again. For us, return success simply to avoid the unimplemented error
+ * in the debug log.
+ */
+static int cs1550_flush (const char *path , struct fuse_file_info *fi)
+{
+        (void) path;
+        (void) fi;
+
+        return 0; //success!
+}
+
+
+//register our new functions as the implementations of the syscalls
+static struct fuse_operations hello_oper = {
+    .getattr    = cs1550_getattr,
+    .readdir    = cs1550_readdir,
+    .mkdir      = cs1550_mkdir,
+        .rmdir = cs1550_rmdir,
+    .read       = cs1550_read,
+    .write      = cs1550_write,
+        .mknod  = cs1550_mknod,
+        .unlink = cs1550_unlink,
+        .truncate = cs1550_truncate,
+        .flush = cs1550_flush,
+        .open   = cs1550_open,
+};
+
+//Don't change this.
+int main(int argc, char *argv[])
+{
+        return fuse_main(argc, argv, &hello_oper, NULL);
+}
+
